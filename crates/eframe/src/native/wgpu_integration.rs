@@ -837,8 +837,6 @@ impl WgpuWinitRunning<'_> {
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
 
         let vsync_secs = if is_visible {
-            let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-
             let mut screenshot_commands = vec![];
             viewport.actions_requested.retain(|cmd| {
                 if let ActionRequested::Screenshot(callback) = cmd {
@@ -848,11 +846,13 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
-            let vsync_secs = painter.paint_and_update_textures(
+            // The painter tessellates the shapes itself, so that with partial repaint it can
+            // compare them to the last frame's first (and skip tessellating an unchanged frame).
+            let vsync_secs = painter.paint_shapes_and_update_textures(
                 viewport_id,
                 pixels_per_point,
                 app.clear_color(&egui_ctx.global_style().visuals),
-                &clipped_primitives,
+                shapes,
                 pending_deltas,
                 screenshot_commands,
                 window,
@@ -882,6 +882,8 @@ impl WgpuWinitRunning<'_> {
 
             vsync_secs
         } else {
+            // A window shown again is painted whole, not compared to what it showed before.
+            painter.forget_last_frame(viewport_id);
             0.0
         };
 

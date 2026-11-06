@@ -345,6 +345,9 @@ pub struct WgpuConfiguration {
     /// Runtime-mutable configuration for the surface (present mode, frame latency).
     pub surface: SurfaceConfig,
 
+    /// Whether the native painter repaints only what changed between frames.
+    pub partial_repaint: PartialRepaint,
+
     /// How to create the wgpu adapter & device
     pub wgpu_setup: WgpuSetup,
 
@@ -357,6 +360,44 @@ pub struct WgpuConfiguration {
     /// in that case either.
     pub on_surface_status:
         Arc<dyn Fn(&wgpu::CurrentSurfaceTexture) -> SurfaceErrorAction + Send + Sync>,
+}
+
+/// Whether the native painter ([`winit::Painter`]) repaints only the part of a window that changed.
+///
+/// Every frame normally clears and repaints the whole window. With partial repaint the painter
+/// keeps the last frame in a texture of its own, compares each frame's shapes to the previous
+/// frame's ([`epaint::DamageTracker`]), skips frames that look the same (no render, no present),
+/// and repaints only the changed rectangles before copying the texture to the window.
+///
+/// This pays off where filling pixels is expensive, above all on software rasterizers (WARP,
+/// llvmpipe), where every repainted pixel costs CPU time. It needs a surface that can be copied
+/// to and no multisampling; otherwise the painter repaints everything as usual. Paint callbacks
+/// and screenshots repaint the whole window.
+///
+/// A skipped frame doesn't wait for vsync, so an app that requests repaints in a loop without
+/// changing anything should limit its frame rate itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PartialRepaint {
+    /// Repaint the whole window every frame.
+    #[default]
+    Off,
+
+    /// Only on adapters that rasterize on the CPU ([`wgpu::DeviceType::Cpu`]).
+    SoftwareAdapters,
+
+    /// On every adapter.
+    Always,
+}
+
+impl PartialRepaint {
+    /// Whether partial repaint applies on an adapter of `device_type`.
+    pub fn applies_to(self, device_type: wgpu::DeviceType) -> bool {
+        match self {
+            Self::Off => false,
+            Self::SoftwareAdapters => device_type == wgpu::DeviceType::Cpu,
+            Self::Always => true,
+        }
+    }
 }
 
 // Compile-time check that `WgpuConfiguration` is `Send + Sync`.
@@ -379,11 +420,13 @@ impl core::fmt::Debug for WgpuConfiguration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Self {
             surface,
+            partial_repaint,
             wgpu_setup,
             on_surface_status: _,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
+            .field("partial_repaint", &partial_repaint)
             .field("wgpu_setup", &wgpu_setup)
             .finish_non_exhaustive()
     }
@@ -401,6 +444,8 @@ impl Default for WgpuConfiguration {
     fn default() -> Self {
         Self {
             surface: SurfaceConfig::HIGH_THROUGHPUT,
+
+            partial_repaint: PartialRepaint::Off,
 
             // No display handle available at this point — callers should replace this with
             // `WgpuSetup::from_display_handle(...)` before creating the instance if one is available.

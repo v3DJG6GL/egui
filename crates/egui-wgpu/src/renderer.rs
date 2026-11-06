@@ -509,6 +509,33 @@ impl Renderer {
         paint_jobs: &[epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
     ) {
+        self.render_within(render_pass, paint_jobs, screen_descriptor, None);
+    }
+
+    /// Like [`Self::render`], but paints only within `damage`, rectangles in points: each is
+    /// painted by its own run over `paint_jobs`, with every scissor limited to it. Pixels outside
+    /// all of them keep what the render target held.
+    ///
+    /// Paint callbacks can set their own scissor, so a frame with any should be rendered whole.
+    pub fn render_damaged(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+        damage: &[epaint::Rect],
+    ) {
+        for rect in damage {
+            self.render_within(render_pass, paint_jobs, screen_descriptor, Some(*rect));
+        }
+    }
+
+    fn render_within(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+        limit: Option<epaint::Rect>,
+    ) {
         profiling::function_scope!();
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
@@ -541,7 +568,8 @@ impl Renderer {
             }
 
             {
-                let rect = ScissorRect::new(clip_rect, pixels_per_point, size_in_pixels);
+                let clip_rect = limit.map_or(*clip_rect, |limit| clip_rect.intersect(limit));
+                let rect = ScissorRect::new(&clip_rect, pixels_per_point, size_in_pixels);
 
                 if rect.width == 0 || rect.height == 0 {
                     // Skip rendering zero-sized clip areas.

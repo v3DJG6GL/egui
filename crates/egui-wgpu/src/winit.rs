@@ -23,6 +23,47 @@ struct SurfaceState {
     resizing: bool,
     needs_reconfigure: bool,
     needs_recreate: bool,
+    /// Partial repaint applies to this surface ([`crate::PartialRepaint`]): the adapter fits the
+    /// option, there is no multisampling, and the surface can be copied to (it is configured with
+    /// [`wgpu::TextureUsages::COPY_DST`]).
+    partial_repaint: bool,
+    /// The last frame and its shapes, while repainting only what changed.
+    retained: Option<RetainedFrame>,
+}
+
+/// The last frame a surface showed, kept for [`crate::PartialRepaint`]: the surface's own
+/// textures are not kept between frames.
+struct RetainedFrame {
+    tracker: epaint::DamageTracker,
+    texture: wgpu::Texture,
+}
+
+impl RetainedFrame {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("egui_retained_frame"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        Self {
+            tracker: epaint::DamageTracker::default(),
+            texture,
+        }
+    }
+
+    fn fits(&self, format: wgpu::TextureFormat, width: u32, height: u32) -> bool {
+        let size = self.texture.size();
+        self.texture.format() == format && size.width == width && size.height == height
+    }
 }
 
 /// The size to configure a window's surface at, and the factor egui
@@ -207,8 +248,13 @@ impl Painter {
         let width = surface_state.width;
         let height = surface_state.height;
 
+        let usage = if surface_state.partial_repaint {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         let mut surf_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage,
             format: render_state.target_format,
             present_mode,
             alpha_mode: surface_state.alpha_mode,
@@ -372,30 +418,43 @@ impl Painter {
         height: u32,
         resizing: bool,
     ) {
-        let alpha_mode = {
+        let (alpha_mode, partial_repaint) = {
             // Panic: We use the same failure mode as `resize_and_generate_depth_texture_view_and_msaa_view`
             let render_state = self
                 .render_state
                 .as_ref()
                 .expect("install_surface called before render_state initialization");
-            if self.support_transparent_backbuffer {
-                let supported_alpha_modes =
-                    surface.get_capabilities(&render_state.adapter).alpha_modes;
-                // Prefer pre multiplied over post multiplied!
-                if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-                    wgpu::CompositeAlphaMode::PreMultiplied
-                } else if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied)
-                {
-                    wgpu::CompositeAlphaMode::PostMultiplied
+            let partial_repaint = self
+                .config
+                .partial_repaint
+                .applies_to(render_state.adapter.get_info().device_type)
+                && self.options.msaa_samples <= 1
+                && surface
+                    .get_capabilities(&render_state.adapter)
+                    .usages
+                    .contains(wgpu::TextureUsages::COPY_DST);
+            let alpha_mode = {
+                if self.support_transparent_backbuffer {
+                    let supported_alpha_modes =
+                        surface.get_capabilities(&render_state.adapter).alpha_modes;
+                    // Prefer pre multiplied over post multiplied!
+                    if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                        wgpu::CompositeAlphaMode::PreMultiplied
+                    } else if supported_alpha_modes
+                        .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+                    {
+                        wgpu::CompositeAlphaMode::PostMultiplied
+                    } else {
+                        log::warn!(
+                            "Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency."
+                        );
+                        wgpu::CompositeAlphaMode::Auto
+                    }
                 } else {
-                    log::warn!(
-                        "Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency."
-                    );
                     wgpu::CompositeAlphaMode::Auto
                 }
-            } else {
-                wgpu::CompositeAlphaMode::Auto
-            }
+            };
+            (alpha_mode, partial_repaint)
         };
         // Store the fitted size, so nothing configures the window's own.
         // `render_scale` starts at 1 so that the resize below, which sets it, logs the fit once.
@@ -413,6 +472,8 @@ impl Painter {
                 resizing,
                 needs_reconfigure: false,
                 needs_recreate: false,
+                partial_repaint,
+                retained: None,
             },
         );
         let Some(width) = NonZeroU32::new(width) else {
@@ -618,6 +679,166 @@ impl Painter {
         capture_data: Vec<egui::ScreenshotCallback>,
         window: &Arc<winit::window::Window>,
     ) -> f32 {
+        // What the retained frame holds is no longer what the window shows.
+        if let Some(surface_state) = self.surfaces.get_mut(&viewport_id) {
+            surface_state.retained = None;
+        }
+        self.paint(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            window,
+            None,
+        )
+    }
+
+    /// Like [`Self::paint_and_update_textures`], but from the frame's shapes, which it
+    /// tessellates itself: with [`crate::PartialRepaint`] it compares them to the previous
+    /// frame's, skips a frame that looks the same, and repaints only what changed.
+    ///
+    /// Returns the approximate number of seconds spent on vsync-waiting.
+    #[expect(clippy::too_many_arguments)]
+    pub fn paint_shapes_and_update_textures(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        mut shapes: Vec<epaint::ClippedShape>,
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<egui::ScreenshotCallback>,
+        window: &Arc<winit::window::Window>,
+    ) -> f32 {
+        profiling::function_scope!();
+        let Some(surface_state) = self.surfaces.get(&viewport_id) else {
+            return 0.0;
+        };
+        // A screenshot is painted into its own texture; a translucent clear colour can't be
+        // painted over the old pixels (it would blend with them).
+        let partial = surface_state.partial_repaint
+            && capture_data.is_empty()
+            && clear_color[3] >= 1.0
+            && surface_state.width > 0
+            && surface_state.height > 0;
+        if !partial {
+            let clipped_primitives = self.context.tessellate(shapes, pixels_per_point);
+            return self.paint_and_update_textures(
+                viewport_id,
+                pixels_per_point,
+                clear_color,
+                &clipped_primitives,
+                textures_delta,
+                capture_data,
+                window,
+            );
+        }
+        let Some(render_state) = self.render_state.as_ref() else {
+            return 0.0;
+        };
+        let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
+            return 0.0;
+        };
+        let (width, height) = (surface_state.width, surface_state.height);
+        let screen_pixels_per_point = pixels_per_point * surface_state.render_scale;
+
+        // The clear colour as a shape under all others: painted within the damage like the
+        // rest, it clears just that, the same way in partial and whole repaints.
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width as f32, height as f32) / screen_pixels_per_point,
+        )
+        .expand(1.0);
+        let [r, g, b, a] = clear_color;
+        let background = egui::Color32::from(egui::Rgba::from_rgba_premultiplied(r, g, b, a));
+        shapes.insert(
+            0,
+            epaint::ClippedShape {
+                clip_rect: screen,
+                shape: epaint::Shape::rect_filled(screen, 0.0, background),
+                transform_after_tessellation: egui::emath::TSTransform::IDENTITY,
+            },
+        );
+
+        let format = render_state.target_format;
+        if surface_state
+            .retained
+            .as_ref()
+            .is_some_and(|retained| !retained.fits(format, width, height))
+        {
+            surface_state.retained = None;
+        }
+        let retained = surface_state
+            .retained
+            .get_or_insert_with(|| RetainedFrame::new(&render_state.device, format, width, height));
+        let tracked = retained
+            .tracker
+            .update(&shapes, screen_pixels_per_point, textures_delta);
+        let mut damage = if surface_state.needs_reconfigure {
+            epaint::Damage::Full
+        } else {
+            tracked
+        };
+
+        if damage == epaint::Damage::None {
+            // Nothing visible changed: no render and no present. New textures are still
+            // uploaded (the next frame may use them), and freed ones freed.
+            profiling::scope!("skip unchanged frame");
+            let mut renderer = render_state.renderer.write();
+            #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
+            for (id, image_deltas) in textures_delta.set.drain() {
+                for image_delta in image_deltas {
+                    renderer.update_texture(
+                        &render_state.device,
+                        &render_state.queue,
+                        id,
+                        &image_delta,
+                    );
+                }
+            }
+            render_state.queue.submit([]);
+            #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
+            for id in textures_delta.free.drain() {
+                renderer.free_texture(&id);
+            }
+            return 0.0;
+        }
+
+        let clipped_primitives = self.context.tessellate(shapes, pixels_per_point);
+        if clipped_primitives
+            .iter()
+            .any(|p| matches!(p.primitive, epaint::Primitive::Callback(_)))
+        {
+            // A callback can paint anywhere, scissor or not.
+            damage = epaint::Damage::Full;
+        }
+        self.paint(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            &clipped_primitives,
+            textures_delta,
+            capture_data,
+            window,
+            Some(&damage),
+        )
+    }
+
+    /// Paint `clipped_primitives`: the whole window, or, with `damage`, into the surface's
+    /// retained frame (only the damage when partial), which is then copied to the window.
+    #[expect(clippy::too_many_arguments)]
+    fn paint(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<egui::ScreenshotCallback>,
+        window: &Arc<winit::window::Window>,
+        damage: Option<&epaint::Damage>,
+    ) -> f32 {
         profiling::function_scope!();
 
         /// Guard to ensure that commands are always submitted to the renderer queue
@@ -749,6 +970,10 @@ impl Painter {
                     SurfaceErrorAction::SkipFrame => {}
                 }
                 if !capture {
+                    // The retained frame wasn't painted: compare the next frame to nothing.
+                    if let Some(retained) = &mut surface_state.retained {
+                        retained.tracker.reset();
+                    }
                     return vsync_sec;
                 }
                 None
@@ -787,6 +1012,8 @@ impl Painter {
                 capture_state.update(&render_state.device, size);
 
                 &capture_state.texture
+            } else if let (Some(_), Some(retained)) = (&damage, &surface_state.retained) {
+                &retained.texture
             } else if let Some(output_frame) = &output_frame {
                 &output_frame.texture
             } else {
@@ -809,12 +1036,17 @@ impl Painter {
                     view,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear_color[0] as f64,
-                            g: clear_color[1] as f64,
-                            b: clear_color[2] as f64,
-                            a: clear_color[3] as f64,
-                        }),
+                        load: if matches!(damage, Some(epaint::Damage::Partial(_))) {
+                            // Only the damage is painted; the rest keeps the last frame.
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: clear_color[0] as f64,
+                                g: clear_color[1] as f64,
+                                b: clear_color[2] as f64,
+                                a: clear_color[3] as f64,
+                            })
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -854,11 +1086,39 @@ impl Painter {
             // Forgetting the pass' lifetime means that we are no longer compile-time protected from
             // runtime errors caused by accessing the parent encoder before the render pass is dropped.
             // Since we don't pass it on to the renderer, we should be perfectly safe against this mistake here!
-            renderer.render(
-                &mut render_pass.forget_lifetime(),
-                clipped_primitives,
-                &screen_descriptor,
-            );
+            if let Some(epaint::Damage::Partial(region)) = &damage {
+                renderer.render_damaged(
+                    &mut render_pass.forget_lifetime(),
+                    clipped_primitives,
+                    &screen_descriptor,
+                    region.rects(),
+                );
+            } else {
+                renderer.render(
+                    &mut render_pass.forget_lifetime(),
+                    clipped_primitives,
+                    &screen_descriptor,
+                );
+            }
+
+            // The retained frame is the window's new content: copy all of it, since the
+            // surface texture doesn't keep the last frame's pixels.
+            if damage.is_some()
+                && let (Some(retained), Some(output_frame)) =
+                    (&surface_state.retained, &output_frame)
+            {
+                let size = retained.texture.size();
+                let frame_size = output_frame.texture.size();
+                encoder.copy_texture_to_texture(
+                    retained.texture.as_image_copy(),
+                    output_frame.texture.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: size.width.min(frame_size.width),
+                        height: size.height.min(frame_size.height),
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
 
             if capture && let Some(capture_state) = &mut self.screen_capture_state {
                 capture_buffer = Some(capture_state.copy_textures(
@@ -916,6 +1176,18 @@ impl Painter {
         }
 
         vsync_sec
+    }
+
+    /// The next frame of `viewport_id` is painted whole, e.g. because the window was hidden
+    /// and what it shows can't be trusted. Only matters with [`crate::PartialRepaint`].
+    pub fn forget_last_frame(&mut self, viewport_id: ViewportId) {
+        if let Some(retained) = self
+            .surfaces
+            .get_mut(&viewport_id)
+            .and_then(|surface_state| surface_state.retained.as_mut())
+        {
+            retained.tracker.reset();
+        }
     }
 
     pub fn gc_viewports(&mut self, active_viewports: &ViewportIdSet) {
