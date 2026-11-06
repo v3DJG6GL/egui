@@ -29,6 +29,8 @@ struct SurfaceState {
     partial_repaint: bool,
     /// The last frame and its shapes, while repainting only what changed.
     retained: Option<RetainedFrame>,
+    /// Whether the log already says why partial repaint can't apply to this surface.
+    fallback_logged: bool,
 }
 
 /// The last frame a surface showed, kept for [`crate::PartialRepaint`]: the surface's own
@@ -477,15 +479,25 @@ impl Painter {
                 .render_state
                 .as_ref()
                 .expect("install_surface called before render_state initialization");
-            let partial_repaint = self
+            let wanted = self
                 .config
                 .partial_repaint
-                .applies_to(render_state.adapter.get_info().device_type)
-                && self.options.msaa_samples <= 1
-                && surface
-                    .get_capabilities(&render_state.adapter)
-                    .usages
-                    .contains(wgpu::TextureUsages::COPY_DST);
+                .applies_to(render_state.adapter.get_info().device_type);
+            let copyable = surface
+                .get_capabilities(&render_state.adapter)
+                .usages
+                .contains(wgpu::TextureUsages::COPY_DST);
+            let partial_repaint = wanted && self.options.msaa_samples <= 1 && copyable;
+            if wanted {
+                if partial_repaint {
+                    log::info!("Partial repaint is on");
+                } else {
+                    log::warn!(
+                        "Partial repaint can't apply (multisampling: {}, surface can be copied to: {copyable}): every frame is repainted whole",
+                        self.options.msaa_samples
+                    );
+                }
+            }
             let alpha_mode = {
                 if self.support_transparent_backbuffer {
                     let supported_alpha_modes =
@@ -527,6 +539,7 @@ impl Painter {
                 needs_recreate: false,
                 partial_repaint,
                 retained: None,
+                fallback_logged: false,
             },
         );
         let Some(width) = NonZeroU32::new(width) else {
@@ -776,6 +789,18 @@ impl Painter {
             && surface_state.width > 0
             && surface_state.height > 0;
         if !partial {
+            if surface_state.partial_repaint
+                && clear_color[3] < 1.0
+                && let Some(surface_state) = self.surfaces.get_mut(&viewport_id)
+                && !surface_state.fallback_logged
+            {
+                surface_state.fallback_logged = true;
+                log::warn!(
+                    "Partial repaint needs an opaque clear colour (`App::clear_color`), \
+                     got alpha {}: every frame is repainted whole",
+                    clear_color[3]
+                );
+            }
             let clipped_primitives = self.context.tessellate(shapes, pixels_per_point);
             return self.paint_and_update_textures(
                 viewport_id,
