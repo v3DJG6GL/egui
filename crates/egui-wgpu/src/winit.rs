@@ -36,6 +36,58 @@ struct SurfaceState {
 struct RetainedFrame {
     tracker: epaint::DamageTracker,
     texture: wgpu::Texture,
+    stats: RepaintStats,
+}
+
+/// How partial repaint fares, logged at debug level (target `egui_wgpu::partial_repaint`)
+/// every few seconds, so a report can show whether frames are skipped or repainted whole.
+#[derive(Default)]
+struct RepaintStats {
+    since: Option<web_time::Instant>,
+    skipped: u32,
+    partial: u32,
+    full: u32,
+    /// The share of the window the partial repaints covered, summed.
+    partial_share: f64,
+}
+
+impl RepaintStats {
+    fn record(&mut self, damage: &epaint::Damage, screen: egui::Rect) {
+        match damage {
+            epaint::Damage::None => self.skipped += 1,
+            epaint::Damage::Partial(region) => {
+                self.partial += 1;
+                let area: f32 = region
+                    .rects()
+                    .iter()
+                    .map(|r| r.intersect(screen).area().max(0.0))
+                    .sum();
+                self.partial_share += f64::from(area / screen.area().max(1.0));
+            }
+            epaint::Damage::Full => self.full += 1,
+        }
+        let now = web_time::Instant::now();
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since).as_secs_f32() >= 5.0 {
+            let average = if self.partial > 0 {
+                100.0 * self.partial_share / f64::from(self.partial)
+            } else {
+                0.0
+            };
+            log::debug!(
+                target: "egui_wgpu::partial_repaint",
+                "last {:.1} s: {} frames skipped, {} partial (on average {average:.0}% of the window), {} full",
+                now.duration_since(since).as_secs_f32(),
+                self.skipped,
+                self.partial,
+                self.full,
+            );
+            *self = Self {
+                since: Some(now),
+                ..Self::default()
+            };
+        }
+    }
 }
 
 impl RetainedFrame {
@@ -57,6 +109,7 @@ impl RetainedFrame {
         Self {
             tracker: epaint::DamageTracker::default(),
             texture,
+            stats: RepaintStats::default(),
         }
     }
 
@@ -780,6 +833,7 @@ impl Painter {
         } else {
             tracked
         };
+        retained.stats.record(&damage, screen);
 
         if damage == epaint::Damage::None {
             // Nothing visible changed: no render and no present. New textures are still
